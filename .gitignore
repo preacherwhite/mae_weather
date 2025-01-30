@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+output*
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff

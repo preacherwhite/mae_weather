@@ -48,12 +48,12 @@ def get_args_parser():
     parser.add_argument('--model', default='mae_vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
 
-    parser.add_argument('--input_size', default=224, type=int,
+    parser.add_argument('--input_size', default=288, type=int,
                         help='images input size')
 
     parser.add_argument('--mask_ratio', default=0.75, type=float,
                         help='Masking ratio (percentage of removed patches).')
-    parser.add_argument('--channel_mask_ratio', default=0, type=float,
+    parser.add_argument('--channel_mask_ratio', default=0.2, type=float,
                         help='Masking ratio (percentage of removed channels).')
     parser.add_argument('--norm_pix_loss', action='store_true',
                         help='Use (per-patch) normalized pixels as targets for computing loss')
@@ -74,10 +74,10 @@ def get_args_parser():
                         help='epochs to warmup LR')
 
     # Dataset parameters
-    # parser.add_argument('--data_path', default='/media/staging2/dhwang/wildfire_data/wildfire_subset', type=str,
-    #                     help='dataset path')
-    parser.add_argument('--data_path', default='/media/staging1/dhwang/Imagenet_data', type=str,
+    parser.add_argument('--data_path', default='/media/staging2/dhwang/wildfire_data/wildfire_subset', type=str,
                         help='dataset path')
+    #parser.add_argument('--data_path', default='/media/staging1/dhwang/Imagenet_data', type=str,
+    #                    help='dataset path')
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default='./output_dir',
@@ -123,14 +123,18 @@ def main(args):
     cudnn.benchmark = True
 
     # simple augmentation
+    mean = np.load('channel_means.npy')
+    std = np.load('channel_stds.npy')
+    print(mean)
+    print(std)
     transform_train = transforms.Compose([
-            transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=mean, std=std),
+            # transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
+            # transforms.RandomHorizontalFlip(),
+            # transforms.ToTensor(),
             ])
-    #dataset_train = MultiChannelDataset(args.data_path, transform=None, target_size=(args.input_size, args.input_size))
-    dataset_train = datasets.ImageFolder(root=args.data_path, transform=transform_train)
+    dataset_train = MultiChannelDataset(args.data_path, transform=transform_train, target_size=(args.input_size, args.input_size))
+    #dataset_train = datasets.ImageFolder(root=args.data_path, transform=transform_train)
     print(dataset_train)
 
     if True:  # args.distributed:
@@ -158,7 +162,7 @@ def main(args):
     )
     
     # define the model
-    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
+    model = models_mae.__dict__[args.model](img_size = args.input_size, in_chans=22, norm_pix_loss=args.norm_pix_loss)
 
     model.to(device)
 

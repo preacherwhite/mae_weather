@@ -15,9 +15,142 @@ import torch
 import torch.nn as nn
 
 from timm.models.vision_transformer import PatchEmbed, Block
-
+from timm.models.layers import trunc_normal_
 from util.pos_embed import get_2d_sincos_pos_embed
+from parallel_patch_embed import ParallelVarPatchEmbed
 
+class ChannelAttention(nn.Module):
+    """
+    Perform channel self-attention on [B, C, H, W],
+    assigning one attention-driven scale factor per channel.
+    
+    Steps:
+      1) Flatten each channel’s (H, W) -> vector of length H*W
+      2) Learn an embedding from size (H*W) -> embed_dim
+      3) Multi-head self-attention across the C channels
+      4) Produce a scale factor per channel, broadcast to (H, W)
+      5) Multiply original x by that scale factor
+    """
+    def __init__(self, in_chans, embed_dim, num_heads=8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+
+        # Project from (H*W) => embed_dim for each channel
+        # (We create this linear AFTER flattening H*W.)
+        # This is effectively a "learned aggregator" over the spatial dimension.
+        self.aggregator = nn.Linear(
+            in_features=0,   # We will set this properly later (see note below)
+            out_features=embed_dim,
+            bias=True
+        )
+
+        # Multi-head attention: expects [seq_len, batch_size, embed_dim]
+        # where seq_len = C (the channels), batch_size = B, embed_dim = E
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=False)
+
+        # Positional embedding for each of the C channels: shape [1, C, E]
+        self.pos_embed = nn.Parameter(torch.zeros(1, in_chans, embed_dim))
+        trunc_normal_(self.pos_embed, std=0.02)
+
+        # Optionally, after attention we create a gating factor per channel
+        # that scales the original x. We'll generate a shape [B, C, 1, 1].
+        self.gate = nn.Linear(embed_dim, 1, bias=True)
+
+        # We'll fill in aggregator.in_features later if you want to set it dynamically.
+        # Alternatively, you can just specify a fixed H, W in the constructor.
+
+
+    def random_masking_channels(self, x, mask_ratio: float):
+        """
+        Optionally mask out some fraction of channels (MAE-style).
+        x: [B, C, H, W]
+        mask_ratio: fraction of channels to mask
+        """
+        B, C, H, W = x.shape
+        len_keep = int(C * (1 - mask_ratio))
+
+        noise = torch.rand(B, C, device=x.device)
+        # Sort channels by noise for each sample in the batch
+        ids_shuffle = torch.argsort(noise, dim=1)       # [B, C]
+        ids_restore = torch.argsort(ids_shuffle, dim=1) # [B, C]
+
+        # Keep the first 'len_keep' channels
+        ids_keep = ids_shuffle[:, :len_keep]            # [B, len_keep]
+        x_masked = torch.gather(
+            x, dim=1,
+            index=ids_keep.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, W)
+        )
+
+        # Construct the binary mask: 0=keep, 1=masked
+        mask = torch.ones([B, C], device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)  # reorder back to original channel order
+
+        return x_masked, mask, ids_restore
+
+
+    def forward(self, x, channel_mask_ratio=0.0):
+        """
+        x: [B, C, H, W]
+        Return: x_out of same shape, after channel-wise attention scaling.
+        """
+        B, C, H, W = x.shape
+
+        # If aggregator.in_features was left as 0, we set it dynamically:
+        if self.aggregator.in_features == 0:
+            self.aggregator = nn.Linear(H*W, self.embed_dim, bias=True).to(x.device)
+
+        # 1) Optional channel masking
+        if channel_mask_ratio > 0:
+            x_masked, mask, ids_restore = self.random_masking_channels(x, channel_mask_ratio)
+        else:
+            x_masked = x
+            mask = None
+            ids_restore = None
+
+        # 2) Flatten spatial dims -> shape [B, C, H*W]
+        x_flat = x_masked.view(B, C, -1)  # => [B, C, H*W]
+
+        # 3) aggregator: project from (H*W) => embed_dim
+        #    So each channel becomes a length-E vector for each sample.
+        #    => shape [B, C, E]
+        x_embed = self.aggregator(x_flat)
+
+        # 4) Add channel positional embedding:
+        #    pos_embed shape is [1, C, E], broadcast to [B, C, E]
+        x_embed = x_embed + self.pos_embed
+
+        # 5) Reorder for multi‐head attention:
+        #    MHA wants [seq_len, batch_size, embed_dim].
+        #    Here, seq_len = C (the channels), batch_size = B.
+        x_embed = x_embed.permute(1, 0, 2)  # => [C, B, E]
+
+        # 6) Self‐attention across channels
+        attn_out, _ = self.attn(x_embed, x_embed, x_embed)  # => [C, B, E]
+
+        # 7) Permute back => [B, C, E]
+        attn_out = attn_out.permute(1, 0, 2)
+
+        # 8) Compute a single gating scalar per channel
+        #    => shape [B, C, 1]
+        gate_weight = self.gate(attn_out)  # => [B, C, 1]
+
+        # 9) Broadcast -> [B, C, 1, 1]
+        gate_weight = gate_weight.unsqueeze(-1)
+
+        # 10) Scale the original x (masked or unmasked) with the learned attention weights
+        x_out = x_masked * gate_weight
+
+        # If you masked channels, you could (optionally) restore them as zeros or do something else
+        # For now we just keep x_out as is. The unmasked channels are scaled. The masked channels are gone.
+
+        # Return the updated feature map
+        if mask is not None:
+            return x_out, mask, ids_restore
+        else:
+            return x_out
 
 class MaskedAutoencoderViT(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
@@ -28,6 +161,10 @@ class MaskedAutoencoderViT(nn.Module):
                  mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False):
         super().__init__()
 
+        # Channel attention block
+        self.channel_attention = ChannelAttention(in_chans=in_chans, 
+                                                embed_dim=embed_dim, 
+                                                num_heads=num_heads)
         # --------------------------------------------------------------------------
         # MAE encoder specifics
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
@@ -94,30 +231,30 @@ class MaskedAutoencoderViT(nn.Module):
 
     def patchify(self, imgs):
         """
-        imgs: (N, 3, H, W)
-        x: (N, L, patch_size**2 *3)
+        imgs: (N, c, H, W)
+        x: (N, L, patch_size**2 *c)
         """
         p = self.patch_embed.patch_size[0]
         assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
-
+        c = imgs.shape[1]
         h = w = imgs.shape[2] // p
-        x = imgs.reshape(shape=(imgs.shape[0], 3, h, p, w, p))
+        x = imgs.reshape(shape=(imgs.shape[0], c, h, p, w, p))
         x = torch.einsum('nchpwq->nhwpqc', x)
-        x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * 3))
+        x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * c))
         return x
 
     def unpatchify(self, x):
         """
-        x: (N, L, patch_size**2 *3)
-        imgs: (N, 3, H, W)
+        x: (N, L, patch_size**2 *c)
+        imgs: (N, c, H, W)
         """
         p = self.patch_embed.patch_size[0]
         h = w = int(x.shape[1]**.5)
         assert h * w == x.shape[1]
-        
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, 3))
+        c = x.shape[2] // (p**2)
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
         x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], 3, h * p, h * p))
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
     def random_masking(self, x, mask_ratio):
@@ -147,7 +284,16 @@ class MaskedAutoencoderViT(nn.Module):
 
         return x_masked, mask, ids_restore
 
-    def forward_encoder(self, x, mask_ratio):
+    def forward_encoder(self, x, mask_ratio, channel_mask_ratio=0.2):
+
+        #Apply channel attention and masking
+        if channel_mask_ratio > 0:
+            x, channel_mask, channel_ids_restore = self.channel_attention(x, channel_mask_ratio)
+        else:
+            x = self.channel_attention(x)
+            channel_mask = None
+            channel_ids_restore = None
+        
         # embed patches
         x = self.patch_embed(x)
 
@@ -167,7 +313,7 @@ class MaskedAutoencoderViT(nn.Module):
             x = blk(x)
         x = self.norm(x)
 
-        return x, mask, ids_restore
+        return x, mask, ids_restore#, channel_mask, channel_ids_restore
 
     def forward_decoder(self, x, ids_restore):
         # embed tokens
@@ -213,11 +359,11 @@ class MaskedAutoencoderViT(nn.Module):
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss
 
-    def forward(self, imgs, mask_ratio=0.75):
-        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
-        pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
+    def forward(self, imgs, mask_ratio=0.75, channel_mask_ratio=0.2):
+        latent, mask, ids_restore= self.forward_encoder(imgs, mask_ratio, channel_mask_ratio)
+        pred = self.forward_decoder(latent, ids_restore)
         loss = self.forward_loss(imgs, pred, mask)
-        return loss, pred, mask
+        return loss, pred, mask#, channel_mask
 
 
 def mae_vit_base_patch16_dec512d8b(**kwargs):
