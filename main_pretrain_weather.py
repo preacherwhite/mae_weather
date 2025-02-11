@@ -31,16 +31,17 @@ import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_mae
-
+import models_mae_channel 
+import models_mae_channel_v2
 from engine_pretrain import train_one_epoch
 
 from weather_tif_dataset import MultiChannelDataset
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
-    parser.add_argument('--batch_size', default=64, type=int,
+    parser.add_argument('--batch_size', default=1, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=400, type=int)
+    parser.add_argument('--epochs', default=100, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
@@ -53,7 +54,7 @@ def get_args_parser():
 
     parser.add_argument('--mask_ratio', default=0.75, type=float,
                         help='Masking ratio (percentage of removed patches).')
-    parser.add_argument('--channel_mask_ratio', default=0.2, type=float,
+    parser.add_argument('--channel_mask_ratio', default=0, type=float,
                         help='Masking ratio (percentage of removed channels).')
     parser.add_argument('--norm_pix_loss', action='store_true',
                         help='Use (per-patch) normalized pixels as targets for computing loss')
@@ -78,9 +79,9 @@ def get_args_parser():
                         help='dataset path')
     #parser.add_argument('--data_path', default='/media/staging1/dhwang/Imagenet_data', type=str,
     #                    help='dataset path')
-    parser.add_argument('--output_dir', default='./output_dir',
+    parser.add_argument('--output_dir', default='./output_channel_masking_V2',
                         help='path where to save, empty for no saving')
-    parser.add_argument('--log_dir', default='./output_dir',
+    parser.add_argument('--log_dir', default='./output_channel_masking_V2',
                         help='path where to tensorboard log')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -101,9 +102,10 @@ def get_args_parser():
                         help='number of distributed processes')
     parser.add_argument('--local_rank', default=-1, type=int)
     parser.add_argument('--dist_on_itp', action='store_true')
-    parser.add_argument('--dist_url', default='env://',
+    parser.add_argument('--dist_url', default='env://127.0.0.1:29600',
                         help='url used to set up distributed training')
 
+    parser.add_argument('--parallel_patch_embed', default=2, type=int)
     return parser
 
 
@@ -162,7 +164,12 @@ def main(args):
     )
     
     # define the model
-    model = models_mae.__dict__[args.model](img_size = args.input_size, in_chans=22, norm_pix_loss=args.norm_pix_loss)
+    if args.parallel_patch_embed == 1:
+        model = models_mae_channel.__dict__[args.model](img_size = args.input_size, in_chans=22, norm_pix_loss=args.norm_pix_loss)
+    elif args.parallel_patch_embed == 2:
+        model = models_mae_channel_v2.__dict__[args.model](img_size = args.input_size, in_chans=22, norm_pix_loss=args.norm_pix_loss)
+    else:
+        model = models_mae.__dict__[args.model](img_size = args.input_size, in_chans=22, norm_pix_loss=args.norm_pix_loss)
 
     model.to(device)
 

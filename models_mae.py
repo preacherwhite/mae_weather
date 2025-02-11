@@ -287,12 +287,12 @@ class MaskedAutoencoderViT(nn.Module):
     def forward_encoder(self, x, mask_ratio, channel_mask_ratio=0.2):
 
         #Apply channel attention and masking
-        if channel_mask_ratio > 0:
-            x, channel_mask, channel_ids_restore = self.channel_attention(x, channel_mask_ratio)
-        else:
-            x = self.channel_attention(x)
-            channel_mask = None
-            channel_ids_restore = None
+        # if channel_mask_ratio > 0:
+        #     x, channel_mask, channel_ids_restore = self.channel_attention(x, channel_mask_ratio)
+        # else:
+        #     x = self.channel_attention(x)
+        #     channel_mask = None
+        #     channel_ids_restore = None
         
         # embed patches
         x = self.patch_embed(x)
